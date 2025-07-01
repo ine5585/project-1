@@ -1,0 +1,81 @@
+name: Deploy Nextcloud to Kubernetes
+
+on:
+  #push:
+  #  branches: [ main ]
+  workflow_dispatch:
+
+env:
+  NEXTCLOUD_VERSION: "31.0.5.1"
+  AWS_REGION: "ap-northeast-2"
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Render config.php using sed
+        run: |
+          sed -e "s|__AWS_ACCESS_KEY_ID__|${{ secrets.AWS_ACCESS_KEY_ID }}|g" \
+              -e "s|__AWS_SECRET_ACCESS_KEY__|${{ secrets.AWS_SECRET_ACCESS_KEY }}|g" \
+              -e "s|__RDS_DB_NAME__|${{ secrets.RDS_DB_NAME }}|g" \
+              -e "s|__RDS_HOST__|${{ secrets.RDS_HOST }}|g" \
+              -e "s|__RDS_USERNAME__|${{ secrets.RDS_USERNAME }}|g" \
+              -e "s|__RDS_PASSWORD__|${{ secrets.RDS_PASSWORD }}|g" \
+              -e "s|__S3_BUCKET__|${{ secrets.S3_BUCKET }}|g" \
+              config.php.template > config.php
+        # run: |
+        #  envsubst < config.php.template > config.php
+        #  cat config.php  # 확인용, 필요없으면 삭제하세요
+          
+      - name: Build Docker image
+        run: |
+          docker build -t nextcloud-s3:${{ github.sha }} .
+          docker tag nextcloud-s3:${{ github.sha }} ${{ secrets.REGISTRY_USERNAME }}/nextcloud:${{ github.sha }}
+          docker tag nextcloud-s3:${{ github.sha }} ${{ secrets.REGISTRY_USERNAME }}/nextcloud:latest  # ✅ latest 태그 추가
+
+      - name: Log in and push to Docker Hub
+        run: |
+          echo "${{ secrets.REGISTRY_PASSWORD }}" | docker login -u "${{ secrets.REGISTRY_USERNAME }}" --password-stdin
+          docker push ${{ secrets.REGISTRY_USERNAME }}/nextcloud:${{ github.sha }}
+          docker push ${{ secrets.REGISTRY_USERNAME }}/nextcloud:latest  # ✅ latest도 푸시
+
+
+
+  deploy-to-cluster:
+    runs-on: self-hosted
+    needs: build-and-push  # 이 줄이 중요! 먼저 build-and-push가 끝난 뒤 실행됨
+
+    steps:
+      - name: Clone project repo
+        run: |
+          rm -rf project
+          rm -rf ~/project
+          git clone https://github.com/parkkyungin/project ~/project
+        
+      - name: Render and apply Kubernetes Secrets
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          RDS_DB_NAME: ${{ secrets.RDS_DB_NAME }}
+          RDS_HOST: ${{ secrets.RDS_HOST }}
+          RDS_USERNAME: ${{ secrets.RDS_USERNAME }}
+          RDS_PASSWORD: ${{ secrets.RDS_PASSWORD }}
+        run: |
+          envsubst '${AWS_ACCESS_KEY_ID} ${AWS_SECRET_ACCESS_KEY} ${RDS_DB_NAME} ${RDS_HOST} ${RDS_USERNAME} ${RDS_PASSWORD}' \
+            < ~/project/k8s/secret-template.yaml > ~/project/k8s/secret.yaml
+            
+      - name: Run Ansible Playbook
+        run: |
+          ansible-playbook ~/project/ansible/playbook.yaml
+      - name: Wait for Nextcloud Pod to be ready
+        run: |
+          echo "Waiting 20 seconds for Nextcloud pod to initialize..."
+          sleep 20
+
+      - name: Check Pod Status
+        run: |
+          ansible master -m shell -a "kubectl get pod"
